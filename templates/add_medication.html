@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+{% block title %}Add New Medication &middot; NMC Pharmacy{% endblock %}
+{% block heading %}Add New Medication{% endblock %}
+{% block content %}{% include "_medication_options.html" %}
+{% if message %}
+    <p class="message {% if 'successfully' in message|lower %}success{% else %}error{% endif %}">{{ message }}</p>
+{% endif %}
+<h2>Add Medication</h2>
+<p>Defines an item so it can be received and dispensed. Supplier, order and invoice
+details are no longer captured here &mdash; they belong to a delivery, on the
+Receiving page.</p>
+<form method="POST" action="/add-medication" class="add-medication-form">
+    <div class="common-section">
+        <div>
+            <label>Medication Name:</label>
+            <input name="med_name" id="med_name" list="med_suggestions" required>
+            {# The suggestions here are what is already on file, so a name
+               appearing as you type means the item exists and needs
+               Receiving, not adding. It is also how a near-duplicate shows
+               itself: "Pyridoxine, 025 mg" appearing while you type
+               "Pyridoxine, 25 mg" is the warning that one of them is a
+               second version of the same thing. #}
+            <p style="font-size:12px; color:#555; margin:4px 0 0;">
+            A name suggested here is <strong>already on file</strong> &mdash;
+            use Receiving to add stock to it. If something close to what you
+            are typing appears, check it is not the same item under another
+            spelling.</p>
+        </div>
+        <div>
+            <label>Product Code (optional):</label>
+            <input name="code" maxlength="30" placeholder="blank = next MED- number"
+                   style="text-transform:uppercase;">
+            <p style="font-size:12px; color:#555; margin:4px 0 0;">Stays with the item even
+            if its name is corrected later. Use an official code if there is one.</p>
+        </div>
+        <div>
+            <label>Category:</label>
+            <select name="category" required>
+                {% for opt in categories %}
+                <option value="{{ opt }}" {% if opt == 'Pharmaceutical' %}selected{% endif %}>{{ opt }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label>Pack Size (units per pack):</label>
+            <input name="pack_size" type="number" min="1" value="1" required>
+        </div>
+        <div>
+            <label>Price per Pack (R):</label>
+            <input name="pack_price" type="number" step="0.01" min="0" required>
+        </div>
+        <div>
+            <label>Schedule:</label>
+            <select name="schedule" required>
+                <option value="">-- Select Schedule --</option>
+                <option value="controlled">Controlled</option>
+                <option value="not controlled">Not Controlled</option>
+            </select>
+        </div>
+    </div>
+
+    <h3>Opening Stock (optional)</h3>
+    <p style="font-size:13px;">Only for stock already on the shelf when this item is
+    first set up &mdash; typically at go-live, where there is no invoice to receive
+    it against. Leave the balance at 0 for a new item whose stock will arrive on a
+    delivery. An opening load is recorded as exactly that, so it is never mistaken
+    for a supplier delivery or a stock-take correction.</p>
+    <div class="common-section">
+        <div>
+            <label>Opening Balance (single units):</label>
+            <input name="initial_balance" type="number" min="0" value="0" required>
+        </div>
+        <div>
+            <label>Batch:</label>
+            <input name="batch">
+        </div>
+        <div>
+            <label>Expiry Date (YYYY-MM-DD):</label>
+            <input name="expiry_date" type="date">
+        </div>
+        <div>
+            <label>Counted By:</label>
+            <input name="stock_receiver" value="{{ current_user }}">
+        </div>
+    </div>
+    <datalist id="med_suggestions"></datalist>
+    <div class="form-buttons">
+        <input type="submit" value="Add Medication">
+        <button type="button" onclick="document.querySelector('form').reset(); document.getElementById('med_suggestions').innerHTML='';">Clear Form</button>
+    </div>
+</form>
+
+{# ---- Many new items at once ---- #}
+{% from "_uploads.html" import upload_box, upload_styles %}
+{{ upload_styles() }}
+{% call upload_box(url_for('add_medication'), 'Many new items? Upload them as a list.', 'upload_meds', {},
+                   url_for('upload_template', kind='medications'),
+                   'One row per item: name, category, schedule, pack size and price, and any opening stock. '
+                   ~ 'Items already on the list are shown and skipped; nothing is added until you press Add These Items.') %}
+{% endcall %}
+
+{% if upload_draft and upload_draft.rows %}
+{% set rows = upload_draft.rows %}
+<div class="up-review" id="upload-review">
+<h3>Uploaded Items &mdash; check, then add</h3>
+<p style="font-size:13px;">Read from &ldquo;{{ upload_draft.meta.sheet }}&rdquo;. Rows in
+<span style="background:#fffbea;">yellow</span> are close to an item already on the list &mdash;
+check they are not the same item under another spelling before adding. Items already on the list
+cannot be added again.</p>
+<form method="POST" action="{{ url_for('add_medication') }}" id="up-meds-form">
+    <input type="hidden" name="action" value="meds_bulk">
+    <input type="hidden" name="n" value="{{ rows|length }}">
+    <div class="table-scroll"><table class="up-sticky">
+        <thead><tr><th>Medication</th><th>Add</th><th>Code</th><th>Category</th><th>Schedule</th><th>Pack size</th>
+            <th>Price per pack (R)</th><th>Opening balance</th><th>Batch</th><th>Expiry</th></tr></thead>
+        <tbody>
+        {% for r in rows %}{% set i = loop.index0 %}
+        <tr class="{% if r.status == 'exists' %}up-bad{% elif r.note or r.problem %}up-guess{% endif %}">
+            <td><input name="name__{{ i }}" value="{{ r.name }}" style="width:16em;" {% if r.status == 'exists' %}readonly{% endif %}>
+                <input type="hidden" name="status__{{ i }}" value="{{ r.status }}">
+                <input type="hidden" name="note__{{ i }}" value="{{ r.note }}">
+                {% if r.note or r.problem %}<span class="up-why">{{ r.note }}{% if r.note and r.problem %}; {% endif %}{{ r.problem }}</span>{% endif %}</td>
+            <td><input type="checkbox" class="up-inc" name="inc__{{ i }}" value="1"
+                       {% if r.status == 'exists' %}disabled{% elif r.include is defined %}{% if r.include %}checked{% endif %}{% elif not r.problem %}checked{% endif %}></td>
+            <td><input name="code__{{ i }}" value="{{ r.code or '' }}" placeholder="auto" style="width:7em;text-transform:uppercase;"></td>
+            <td><select name="category__{{ i }}" style="width:auto;">
+                {% for cat in categories %}<option value="{{ cat }}" {% if cat == r.category %}selected{% endif %}>{{ cat }}</option>{% endfor %}
+            </select></td>
+            <td><select name="schedule__{{ i }}" style="width:auto;">
+                {% for sch in ['not controlled', 'controlled'] %}<option value="{{ sch }}" {% if sch == r.schedule %}selected{% endif %}>{{ sch|title }}</option>{% endfor %}
+            </select></td>
+            <td><input name="pack_size__{{ i }}" value="{{ r.pack_size }}" type="number" min="1" step="1" style="width:5em;"></td>
+            <td><input name="pack_price__{{ i }}" value="{{ r.pack_price }}" type="number" min="0" step="0.01" style="width:7em;"></td>
+            <td><input name="opening__{{ i }}" value="{{ r.opening }}" type="number" min="0" step="1" style="width:6em;"></td>
+            <td><input name="batch__{{ i }}" value="{{ r.batch }}" style="width:8em;"></td>
+            <td><input name="expiry__{{ i }}" value="{{ r.expiry }}" type="date" style="width:10.5em;"></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+    <div class="form-buttons"><input type="submit" value="Add These Items"></div>
+</form>
+<form method="POST" action="{{ url_for('add_medication') }}" style="margin-top:4px;background:none;box-shadow:none;">
+    <input type="hidden" name="action" value="discard_meds">
+    <button type="submit" class="delete-btn" onclick="return confirm('Discard the uploaded list?');">Discard Upload</button>
+</form>
+</div>
+{% endif %}
+
+{# ---- Standardise names from a reviewed list ---- #}
+{% call upload_box(url_for('add_medication'), 'Standardise names from a list.', 'upload_names', {},
+                   url_for('upload_template', kind='renames'),
+                   'Columns: Current name, Standard name, Apply (Yes / No / Check). Each rename keeps the '
+                   ~ "item's history, code and old name; nothing changes until you press Rename Ticked Items.",
+                   button='Read Rename List', anchor='names') %}
+{% endcall %}
+
+{% if rename_draft and rename_draft.rows %}
+{% set rrows = rename_draft.rows %}
+<div class="up-review" id="names-review">
+<h3>Renames from "{{ rename_draft.meta.sheet }}" &mdash; {{ rrows|length }} row(s)</h3>
+<p style="font-size:13px;">Ticked rows are renamed. Rows marked <strong>Yes</strong> in the sheet start ticked;
+<strong>Check</strong> and <strong>No</strong> do not. You can still correct a new name here.
+<a href="#" onclick="document.querySelectorAll('.ren-tick:not(:disabled)').forEach(function(x){x.checked=true});return false;">Tick all that are ready</a>
+&middot; <a href="#" onclick="document.querySelectorAll('.ren-tick').forEach(function(x){x.checked=false});return false;">Untick all</a></p>
+<form method="POST" action="{{ url_for('add_medication') }}" class="up-review-form">
+    <input type="hidden" name="action" value="names_bulk">
+    <div class="table-scroll"><table>
+        <thead><tr><th>Rename</th><th>Current name</th><th>New name</th><th>Sheet said</th></tr></thead>
+        <tbody>
+        {% for r in rrows %}{% set i = loop.index0 %}
+        <tr class="{% if r.status in ('clash', 'missing', 'empty') %}up-bad{% elif r.status == 'same' %}{% elif r.marked|lower == 'check' %}up-guess{% endif %}">
+            <td style="text-align:center;"><input type="checkbox" class="ren-tick" name="ren__{{ i }}" value="1"
+                       {% if r.status != 'ok' %}disabled{% elif r.apply %}checked{% endif %}></td>
+            <td>{{ r.current }}{% if r.why %}<span class="up-why">{{ r.why }}</span>{% endif %}
+                {%- if r.note %}<span class="up-why">Check: {{ r.note }}</span>{% endif %}</td>
+            <td><input name="new__{{ i }}" value="{{ r.new }}" style="width:24em;" {% if r.status != 'ok' %}readonly{% endif %}></td>
+            <td>{{ (r.marked or '-')|capitalize }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+    <div class="form-buttons"><input type="submit" value="Rename Ticked Items"
+         onclick="return confirm('Rename the ticked items? Each keeps its history and its old name stays searchable.');"></div>
+</form>
+<form method="POST" action="{{ url_for('add_medication') }}" style="margin-top:4px;background:none;box-shadow:none;">
+    <input type="hidden" name="action" value="discard_names">
+    <button type="submit" class="delete-btn" onclick="return confirm('Discard the rename list?');">Discard Rename List</button>
+</form>
+</div>
+{% endif %}
+<script>
+document.addEventListener('DOMContentLoaded', async function() {
+    const medInput = document.getElementById('med_name');
+    const datalist = document.getElementById('med_suggestions');
+    // FIX (Performance): fetch from /api/medications
+    const options = await getMedicationOptions();
+    options.forEach(m => {
+        const o = document.createElement('option');
+        o.value = m;
+        datalist.appendChild(o);
+    });
+    medInput.addEventListener('input', function() {
+        const q = this.value.toLowerCase();
+        Array.from(datalist.options).forEach(o => {
+            o.style.display = o.value.toLowerCase().includes(q) ? '' : 'none';
+        });
+    });
+});
+</script>
+{% endblock %}

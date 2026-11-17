@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Edit Medication &middot; NMC Pharmacy{% endblock %}
+{% block heading %}Edit Medication{% endblock %}
+{% block content %}{% if message %}
+    <p class="message {% if 'successfully' in message|lower %}success{% else %}error{% endif %}">{{ message }}</p>
+{% endif %}
+<h2>Edit {{ med_data.name if med_data else '' }}</h2>
+<p style="font-size:13px;">Changes the item's details: name, code, pack size, price, batch,
+expiry and schedule. <strong>Changing the name keeps the history</strong>: every
+dispense, receipt, issue, count and request moves to the new name with it, and the
+old name still finds the item in uploaded spreadsheets. It does <strong>not</strong> change the quantity on hand
+&mdash; stock moves only through receiving, dispensing, a stock-take count or an
+expiry write-off, so that every change has a record behind it. To correct a
+balance, run a stock take and enter the physical count.</p>
+<form method="POST" action="{{ url_for('edit_medication') }}" class="edit-medication-form">
+    <div class="common-section">
+        <div>
+            <label>Medication Name:</label>
+            <input type="hidden" name="med_name" value="{{ med_data.name if med_data else '' }}">
+            <input name="new_name" value="{{ med_data.name if med_data else '' }}" required maxlength="120">
+            {% if med_data and med_data.get('former_names') %}
+            <small>Formerly: {{ med_data.former_names|join(', ') }}</small>
+            {% endif %}
+        </div>
+        <div>
+            <label>Product Code:</label>
+            <input name="code" value="{{ med_data.get('code') or '' if med_data else '' }}" maxlength="30"
+                   placeholder="e.g. MED-0042 or the official code" style="text-transform:uppercase;">
+            <small>Stays with the item if the name changes. Type over it to use an official code.</small>
+        </div>
+        <div>
+            <label>Shelf Location (optional):</label>
+            <input name="location" value="{{ med_data.get('location') or '' if med_data else '' }}" maxlength="30"
+                   placeholder="e.g. B3" style="text-transform:uppercase;">
+            <small>The count sheet and the phone app list items in shelf order.</small>
+        </div>
+        <div>
+            <label>Barcode (optional):</label>
+            <input name="barcode" value="{{ med_data.get('barcode') or '' if med_data else '' }}" maxlength="40"
+                   inputmode="numeric" placeholder="the number under the barcode on the box">
+            <small>Easier: scan it with the phone app while counting, and it is saved here when you upload.</small>
+        </div>
+        {# FIX (Data integrity): the Balance field used to live here, and writing to
+   it changed stock with NO transaction behind it — the one remaining way to
+   move stock without a trace, which is exactly what the stock take, the
+   expiry write-off and the delivery ledger were built to prevent. A balance
+   edited here would break every back-calculated beginning balance silently.
+   Stock now moves only through: receiving, dispensing, a stock-take count,
+   or an expiry write-off. #}
+        <div>
+            <label>Batch:</label>
+            <input name="batch" value="{{ med_data.batch if med_data else '' }}" required>
+        </div>
+        <div>
+            <label>Category:</label>
+            <select name="category" required>
+                {% for opt in categories %}
+                <option value="{{ opt }}" {% if med_data and med_data.get('category', 'Pharmaceutical') == opt %}selected{% endif %}>{{ opt }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label>Pack Size (units per pack):</label>
+            <input name="pack_size" type="number" min="1"
+                   value="{{ med_data.get('pack_size', 1) if med_data else 1 }}" required>
+        </div>
+        <div>
+            <label>Price per Pack (R):</label>
+            <input name="pack_price" type="number" step="0.01" min="0"
+                   value="{{ med_data.get('pack_price', med_data.price) if med_data else '' }}" required>
+        </div>
+        <div>
+            <label>Expiry Date (YYYY-MM-DD):</label>
+            <input name="expiry_date" type="date" value="{{ med_data.expiry_date if med_data else '' }}" required>
+        </div>
+        <div>
+            <label>Schedule:</label>
+            <select name="schedule" required>
+                <option value="">-- Select Schedule --</option>
+                <option value="controlled" {% if med_data and med_data.schedule == 'controlled' %}selected{% endif %}>Controlled</option>
+                <option value="not controlled" {% if med_data and med_data.schedule == 'not controlled' %}selected{% endif %}>Not Controlled</option>
+            </select>
+        </div>
+    </div>
+    <div class="form-buttons">
+        <input type="submit" value="Update Medication">
+        <a href="{{ url_for('reports', report_type='stock_on_hand') }}"><button type="button">Cancel</button></a>
+    </div>
+</form>
+{% endblock %}

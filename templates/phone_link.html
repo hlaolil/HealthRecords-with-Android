@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{#- Linking the NMC Stock Take phone app. The QR code holds this site's
+    address and a key that is shown once, here, and never again: only a hash
+    of it is kept. A lost or replaced phone is unlinked below. -#}
+{% block title %}Phone App &middot; NMC Pharmacy{% endblock %}
+{% block heading %}Phone App{% endblock %}
+{% block page_styles %}
+<style>
+.pl-qr { background: #fff; padding: 12px; display: inline-block; border: 1px solid #ccc; border-radius: 8px; }
+.pl-qr svg { width: 260px; height: 260px; }
+.pl-code { font-family: monospace; font-size: 12px; word-break: break-all; background: #f4f6f8; padding: 8px; border-radius: 6px; }
+.pl-new { border: 2px solid #0056b3; border-radius: 10px; padding: 14px; margin: 10px 0 20px; }
+</style>
+{% endblock %}
+{% block content %}
+{% if message %}<p class="message success">{{ message }}</p>{% endif %}
+<p><a href="{{ url_for('stock_take') }}">&larr; Stock Take</a></p>
+
+<p>Link the NMC Stock Take phone app to this site once. After that the phone can
+<strong>get a count sheet</strong> for the open stock take and <strong>send its counts</strong>
+straight here, with no files to save or upload. Counts sent from the phone wait on the
+Stock Take page, highlighted, until you check them and press <strong>Post Uploaded Counts</strong>.</p>
+
+{% if new_link %}
+<div class="pl-new">
+    <h3>Scan this with the phone app</h3>
+    <p>In the app, tap <strong>Link to the web app</strong> and point the camera at this code.
+    It is shown only now: once you leave this page it cannot be shown again (link again if needed).</p>
+    {% if new_link.qr_svg %}<div class="pl-qr">{{ new_link.qr_svg|safe }}</div>{% endif %}
+    <p>No camera? Copy this into the app instead:</p>
+    <div class="pl-code">{{ new_link.text }}</div>
+</div>
+{% endif %}
+
+<h3>Link a phone</h3>
+<form method="POST" action="{{ url_for('phone_link') }}">
+    <input type="hidden" name="action" value="create">
+    <label>Which phone (so you can tell them apart):</label>
+    <input name="label" type="text" maxlength="40" placeholder="e.g. Pharmacy Samsung">
+    <input type="submit" value="Show Link Code">
+</form>
+
+<h3>Linked phones ({{ links|length }})</h3>
+<div class="table-scroll"><table>
+    <thead><tr><th>Phone</th><th>Linked by</th><th>Linked</th><th>Last used</th><th></th></tr></thead>
+    <tbody>
+    {% for l in links %}
+        <tr>
+            <td>{{ l.label }}</td>
+            <td>{{ l.name }}</td>
+            <td>{{ l.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td>{{ l.last_used.strftime('%Y-%m-%d %H:%M') if l.last_used else 'not yet' }}</td>
+            <td><form method="POST" action="{{ url_for('phone_link') }}" style="margin:0;padding:0;background:none;box-shadow:none;">
+                <input type="hidden" name="action" value="unlink">
+                <input type="hidden" name="link_id" value="{{ l._id|string }}">
+                <button type="submit" class="delete-btn" onclick="return confirm('Unlink {{ l.label }}? It will no longer reach this site.');">Unlink</button>
+            </form></td>
+        </tr>
+    {% else %}
+        <tr><td colspan="5">No phone is linked yet.</td></tr>
+    {% endfor %}
+    </tbody>
+</table></div>
+<p><small>A lost or replaced phone: unlink it here. Counts already sent from it stay as they are.</small></p>
+{% endblock %}
