@@ -724,7 +724,7 @@ check('the CSV count sheet downloads with a BOM, as CSV',
       and '.csv' in r.headers['Content-Disposition'], r.headers.get('Content-Disposition', ''))
 check('its columns are the ones the app reads',
       rows_csv[0] == ['Code', 'Medication', 'On system', 'Physical count', 'Expiry date', 'Batch', 'Note', 'Group',
-                      'Location', 'Pack size', 'Barcode'],
+                      'Location', 'Pack size', 'Barcode', 'Counted by'],
       str(rows_csv[0]))
 by_csv = {row[1]: row for row in rows_csv[1:]}
 amox = by_csv.get('Amoxicillin caps, 500 mg')

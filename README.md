@@ -12,6 +12,10 @@ This copy works with the **NMC Stock Take** phone app
 - **Receiving:** upload a delivery's invoice as usual; the phone gets its lines, checks each box
   (quantity, batch, expiry, barcode) and sends them back, in parts if you like. Differences from
   the invoice are marked in red. Nothing is received until Add These Lines is pressed.
+- **Several phones at once:** each phone's figure for each item (or invoice line) is kept separately,
+  so phones sending together never overwrite each other. Items another phone has done are marked on
+  the phone and passed over. Where two phones disagree the item is flagged in red with both figures
+  and is not posted until counted again; each posted count records which phone(s) it came from.
 - **Linking a phone:** Stock Take page > *link the phone app* (or `/phone-link`) shows a QR code
   to scan once. Phones can be unlinked there.
 

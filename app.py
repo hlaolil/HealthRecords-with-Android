@@ -394,6 +394,11 @@ def init_db_collections() -> None:
         # action/target_type/target_id/user via $or regex, plus an exact
         # lookup pattern (target_type + target_id) for "history of this record".
         db['audit_log'].create_index([('timestamp', -1)])
+        # One entry per phone per item (stock take) or per invoice line
+        # (receiving): each phone writes only its own, so phones counting at
+        # the same time never overwrite one another.
+        db['phone_entries'].create_index([('kind', 1), ('context', 1), ('key', 1), ('link_id', 1)],
+                                         unique=True)
         db['audit_log'].create_index([('action', 1)])
         db['audit_log'].create_index([('target_type', 1), ('target_id', 1)])
         db['audit_log'].create_index([('user', 1)])
@@ -2386,6 +2391,7 @@ def receive() -> ResponseReturnValue:
                     return redirect(url_for('receive', delivery_id=str(d['_id'])))
                 if action == 'discard_upload':
                     _draft_drop(db, login, 'receive', str(d['_id']))
+                    _phone_entries_drop(db, 'receive', str(d['_id']))
                     flash('The uploaded lines were discarded. Nothing was added.')
                     return redirect(url_for('receive', delivery_id=str(d['_id'])))
                 if action == 'upload_lines':
@@ -2403,6 +2409,9 @@ def receive() -> ResponseReturnValue:
                         return back
                     _draft_put(db, login, 'receive', str(d['_id']), found['rows'],
                                {'sheet': found['sheet'], 'mode': mode})
+                    # A new invoice numbers its lines afresh: earlier phone
+                    # checks belonged to the old lines.
+                    _phone_entries_drop(db, 'receive', str(d['_id']))
                     flagged = sum(1 for r in found['rows'] if r['problem'])
                     flash(f"Read {len(found['rows'])} line(s) from \"{found['sheet']}\". "
                           f"Nothing has been added yet - check the lines below"
@@ -2427,14 +2436,17 @@ def receive() -> ResponseReturnValue:
                     })
                 # What the page does not carry - the line's number, what the
                 # phone recorded - comes from the waiting lines it was drawn from.
-                was = (_draft_get(db, login, 'receive', str(d['_id'])) or {}).get('rows') or []
+                was = (_receive_waiting(db, login, d) or {}).get('rows') or []
                 for i, r in enumerate(rows):
                     if i < len(was):
-                        for k in ('line', 'phone_checked', 'invoice_units', 'phone_note', 'guessed'):
+                        for k in ('line', 'phone_checked', 'invoice_units', 'phone_note', 'guessed',
+                                  'phones'):
                             if k in was[i]:
                                 r[k] = was[i][k]
                     r.setdefault('line', i + 1)
-                    r['include_set'] = True       # ticked or not by a person, on the page
+                    # When a person last ticked or unticked it on the page; a
+                    # phone check sent after that ticks it again.
+                    r['include_set'] = datetime.utcnow()
                 plan, problems = [], []
                 for i, r in enumerate(rows):
                     if not r['include']:
@@ -2484,6 +2496,8 @@ def receive() -> ResponseReturnValue:
                 # Lines left unticked stay waiting, so an invoice can be
                 # received in parts (checked on the phone a shelf at a time).
                 left = [r for r in rows if not r['include']]
+                _phone_entries_drop(db, 'receive', str(d['_id']),
+                                    [r['line'] for r in rows if r['include']])
                 if left:
                     for r in left:
                         r['matched'] = bool(r['name'] and medications.find_one({'name': r['name']}))
@@ -2542,8 +2556,7 @@ def receive() -> ResponseReturnValue:
                                         sum(_line_value(l) for l in delivery_lines))
             order_summary = _order_rollup(deliveries, transactions,
                                           delivery.get('order_number'))
-            upload_draft = _draft_get(db, session['user'].get('login'), 'receive',
-                                      str(delivery['_id']))
+            upload_draft = _receive_waiting(db, session['user'].get('login'), delivery)
         elif not rx_data:
             delivery_rows = list(deliveries.find().sort([('status', 1), ('opened_at', -1)]).limit(200))
             values = _delivery_values(transactions, [str(d['_id']) for d in delivery_rows])
@@ -10022,6 +10035,7 @@ def stock_take() -> ResponseReturnValue:
                 login = session['user'].get('login')
                 if action == 'discard_counts':
                     _draft_drop(db, login, 'stock_take', str(st['_id']))
+                    _phone_entries_drop(db, 'stock_take', str(st['_id']))
                     flash('The uploaded counts were cleared from the sheet. Nothing was posted.')
                     return redirect(url_for('stock_take', stock_take_id=str(st['_id'])))
                 try:
@@ -10142,15 +10156,23 @@ def stock_take() -> ResponseReturnValue:
                 # filled in needs to travel. The older shape (a med_name
                 # list in row order) is still read.
                 form: Any = request.form
-                up = _draft_get(db, session['user'].get('login'), 'stock_take',
-                                str(st['_id']))
+                up = _stock_take_waiting(db, session['user'].get('login'), st)
                 shelf_rows = [r for r in (up or {}).get('rows') or []
                               if r.get('location') or r.get('barcode')]
+                # Where each waiting figure came from, recorded on its line;
+                # and the items phones disagree on, which are not posted.
+                source_of = {r['name']: ('phone: ' + (r.get('agreed_by') or r['phones'])
+                                         if r.get('phones') else 'uploaded sheet')
+                             for r in (up or {}).get('rows') or []}
+                disputed = {r['name'] for r in (up or {}).get('rows') or [] if r.get('conflict')}
+                waiting_count = {r['name']: r.get('counted', '') for r in (up or {}).get('rows') or []}
+                recorded: set[str] = set()
                 if action == 'post_uploaded':
                     # Post the uploaded figures straight from the saved
                     # draft: the browser sends next to nothing.
                     form = {}
-                    for i, row in enumerate((up or {}).get('rows') or []):
+                    for i, row in enumerate(r_ for r_ in (up or {}).get('rows') or []
+                                            if not r_.get('conflict')):
                         form[f'med__{i}'] = row.get('name') or ''
                         form[f'counted__{i}'] = str(row.get('counted', ''))
                         form[f'expiry__{i}'] = row.get('expiry') or ''
@@ -10223,10 +10245,15 @@ def stock_take() -> ResponseReturnValue:
                     outcome = _record_count(
                         medications, transactions, counts_col, st, name, counted,
                         (form.get(f'note__{i}') or '').strip(), current_user,
-                        expiry=expiry or None, batch=batch or None, agree=agree)
+                        expiry=expiry or None, batch=batch or None, agree=agree,
+                        # Credited to the phone or sheet only if the figure is
+                        # still theirs: one typed over on the page is the page's.
+                        source=(source_of.get(name, '')
+                                if raw != '' and str(waiting_count.get(name, '')) == raw else ''))
                     if outcome is None:
                         skipped += 1
                         continue
+                    recorded.add(name)
                     if agree:
                         confirmed += 1
                     detail_changes += outcome['detail_changes']
@@ -10242,6 +10269,7 @@ def stock_take() -> ResponseReturnValue:
                         over += 1
 
                 if tick_only:
+                    recorded.update(tick_only)
                     n_ok, n_missing = _record_agreed_many(medications, counts_col, st,
                                                           tick_only, current_user)
                     posted += n_ok
@@ -10271,10 +10299,26 @@ def stock_take() -> ResponseReturnValue:
                 shelf_saved = _apply_shelf_details(medications, shelf_rows, st) if shelf_rows else 0
                 if shelf_saved:
                     msg += f' Shelf location or barcode saved for {shelf_saved} item(s).'
+                still_disputed = disputed - recorded
+                if still_disputed:
+                    msg += (f' {len(still_disputed)} item(s) the phones disagree on were not posted: '
+                            + _brief(sorted(still_disputed), 3) + '. Count them again.')
                 if posted or details_only or confirmed or shelf_saved:
                     # The uploaded figures have been posted or looked over;
-                    # what was left unposted goes back to blank boxes.
-                    _draft_drop(db, session['user'].get('login'), 'stock_take', str(st['_id']))
+                    # what was left unposted goes back to blank boxes -
+                    # except items the phones disagree on, which stay
+                    # flagged until someone counts them.
+                    sid_ = str(st['_id'])
+                    login_ = session['user'].get('login')
+                    kept_rows = [r for r in (_draft_get(db, login_, 'stock_take', sid_) or {}).get('rows') or []
+                                 if r.get('name') in still_disputed]
+                    if kept_rows:
+                        _draft_put(db, login_, 'stock_take', sid_, kept_rows,
+                                   (_draft_get(db, login_, 'stock_take', sid_) or {}).get('meta'))
+                    else:
+                        _draft_drop(db, login_, 'stock_take', sid_)
+                    _phone_entries_drop(db, 'stock_take', sid_,
+                                        set(_phone_entries(db, 'stock_take', sid_)) - still_disputed)
                 flash(msg)
                 return redirect(url_for('stock_take', stock_take_id=str(st['_id'])))
 
@@ -10390,8 +10434,7 @@ def stock_take() -> ResponseReturnValue:
                             for g, _ in COUNT_GROUPS}
             # Figures brought in from an uploaded count sheet, shown in the
             # boxes for checking. They are posted only by Post Counts.
-            upload_draft = _draft_get(db, session['user'].get('login'), 'stock_take',
-                                      str(active['_id']))
+            upload_draft = _stock_take_waiting(db, session['user'].get('login'), active)
             pre = {r['name']: r for r in (upload_draft or {}).get('rows', [])}
             for row in sheet:
                 p_ = pre.get(row['name'])
@@ -10507,7 +10550,7 @@ def _count_sheet(medications: Collection, counts_col: Collection,
 
 COUNT_SHEET_CSV_HEADINGS = ['Code', 'Medication', 'On system', 'Physical count',
                             'Expiry date', 'Batch', 'Note', 'Group',
-                            'Location', 'Pack size', 'Barcode']
+                            'Location', 'Pack size', 'Barcode', 'Counted by']
 
 
 def _count_sheet_csv(st: Doc, rows: list[Doc], slug: str = '') -> Any:
@@ -10523,10 +10566,12 @@ def _count_sheet_csv(st: Doc, rows: list[Doc], slug: str = '') -> Any:
     w.writerow(COUNT_SHEET_CSV_HEADINGS)
     for r in rows:
         exp = _expiry_iso(r['expiry']) if r['expiry'] else ''
-        w.writerow([r['code'] or '', r['name'], r['balance'], '',
+        # For a phone: its own figure if it already sent one (so getting the
+        # sheet again carries on), and which other phones have counted it.
+        w.writerow([r['code'] or '', r['name'], r['balance'], r.get('own_count', ''),
                     datetime.strptime(exp, '%Y-%m-%d').strftime('%d/%m/%Y') if exp else '',
                     r['batch'] or '', '', labels.get(r['group'], ''),
-                    r['location'], r['pack_size'], r['barcode']])
+                    r['location'], r['pack_size'], r['barcode'], r.get('counted_by', '')])
     resp = make_response(out.getvalue().encode('utf-8-sig'))
     resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
     resp.headers['Content-Disposition'] = (
@@ -10539,18 +10584,13 @@ COUNT_UPLOAD_COLUMNS = ['med', 'code', 'counted', 'qty', 'expiry', 'batch', 'not
 COUNT_UPLOAD_NEEDS = [['med', 'code'], ['counted', 'qty', 'expiry', 'batch', 'location', 'barcode']]
 
 
-def _stage_count_upload(db: Any, medications: Collection, login: str | None, st: Doc,
-                        table: Doc) -> str:
-    """Read a filled-in count sheet into the stock take's waiting figures.
+def _read_count_rows(medications: Collection, st: Doc, table: Doc) -> Doc:
+    """The entries on a filled-in count sheet, matched to items.
 
-    Nothing is posted: the figures fill the sheet on the page for checking,
-    and Post Counts (or Post Uploaded Counts) posts them. Used by the upload
-    on the page and by the phone app sending its counts directly. Returns
-    the message to show.
-
-    Besides counts, expiry and batch, a sheet may carry a shelf location and
-    a barcode (the phone app records both while counting). Those are saved
-    to the item when the counts are posted.
+    Returns {'filled': {name: entry}, 'unknown', 'guesses', 'bad', 'outside'}.
+    An entry holds counted ('' when not counted), expiry, batch, note,
+    location, barcode and guessed. Rows sent back as they came (nothing
+    counted, details as on file) are not entries.
     """
     cols = table['cols']
     active_meds = list(medications.find(_active(), {
@@ -10621,6 +10661,26 @@ def _stage_count_upload(db: Any, medications: Collection, login: str | None, st:
         filled[name] = {'counted': '' if cv is None else int(cv),
                         'expiry': exp or '', 'batch': batch, 'note': note,
                         'location': loc, 'barcode': code_bar, 'guessed': guessed}
+    return {'filled': filled, 'unknown': unknown, 'guesses': guesses, 'bad': bad,
+            'outside': outside}
+
+
+def _stage_count_upload(db: Any, medications: Collection, login: str | None, st: Doc,
+                        table: Doc) -> str:
+    """Read a filled-in count sheet into the stock take's waiting figures.
+
+    Nothing is posted: the figures fill the sheet on the page for checking,
+    and Post Counts (or Post Uploaded Counts) posts them. Used by the upload
+    on the page and by the phone app sending its counts directly. Returns
+    the message to show.
+
+    Besides counts, expiry and batch, a sheet may carry a shelf location and
+    a barcode (the phone app records both while counting). Those are saved
+    to the item when the counts are posted.
+    """
+    got = _read_count_rows(medications, st, table)
+    filled, unknown, guesses, bad, outside = (got['filled'], got['unknown'], got['guesses'],
+                                              got['bad'], got['outside'])
     # Sheets come one shelf group at a time, so a second upload adds to what
     # is already waiting instead of replacing it. The same item uploaded
     # again takes the newer figure.
@@ -10651,6 +10711,143 @@ def _stage_count_upload(db: Any, medications: Collection, login: str | None, st:
     if bad:
         msg += ' Not read: ' + _brief(bad, 3) + '.'
     return msg
+
+
+# --- Several phones at once -------------------------------------------
+# Each phone's figure for each item (or invoice line) is its own record in
+# phone_entries, written in one step. Two phones sending at the same moment
+# each write their own records, so neither can wipe out the other. The
+# records are combined only when the page is shown or the counts posted:
+# phones that agree are named together; phones that disagree are flagged,
+# and that item is not posted until it is counted again.
+def _phone_entries_put(db: Any, kind: str, context: str, link: Doc, items: dict[str, Doc]) -> None:
+    now = datetime.utcnow()
+    ops = [UpdateOne({'kind': kind, 'context': context, 'key': str(k),
+                      'link_id': str(link['_id'])},
+                     {'$set': {'data': v, 'label': link.get('label') or 'Phone', 'sent_at': now}},
+                     upsert=True)
+           for k, v in items.items()]
+    if ops:
+        db['phone_entries'].bulk_write(ops, ordered=False)
+
+
+def _phone_entries(db: Any, kind: str, context: str) -> dict[str, list[Doc]]:
+    """{key: [entries, oldest first]} for one stock take or delivery."""
+    out: dict[str, list[Doc]] = defaultdict(list)
+    for e in db['phone_entries'].find({'kind': kind, 'context': context}).sort('sent_at', 1):
+        out[e['key']].append(e)
+    return dict(out)
+
+
+def _phone_entries_drop(db: Any, kind: str, context: str, keys: Iterable[Any] | None = None) -> None:
+    q: Doc = {'kind': kind, 'context': context}
+    if keys is not None:
+        q['key'] = {'$in': [str(k) for k in keys]}
+    db['phone_entries'].delete_many(q)
+
+
+def _labels(names: Iterable[str]) -> str:
+    return ', '.join(dict.fromkeys(names))
+
+
+def _stock_take_waiting(db: Any, login: Any, st: Doc) -> Doc | None:
+    """What is waiting to be posted on a stock take: this person's uploaded
+    sheets and every phone's counts, one row per item.
+
+    A row from phones carries 'phones' (who sent it). Where two sources give
+    different counts the row has 'conflict' ("Samsung 40, Tecno 38") and no
+    count, so it is not posted until someone counts it again.
+    """
+    sid = str(st['_id'])
+    draft = _draft_get(db, login, 'stock_take', sid) or {}
+    rows: dict[str, Doc] = {r['name']: dict(r) for r in draft.get('rows') or []}
+    entries = _phone_entries(db, 'stock_take', sid)
+    for name, ents in entries.items():
+        base = rows.get(name) or {}
+        row: Doc = {'name': name, 'counted': '', 'expiry': '', 'batch': '', 'note': '',
+                    'location': '', 'barcode': '', 'guessed': False}
+        counts: dict[str, Any] = {}
+        if base.get('counted') not in ('', None):
+            counts['the uploaded sheet'] = base['counted']
+        notes = [base['note']] if base.get('note') else []
+        for e in ents:                       # oldest first: the newest detail wins
+            d = e.get('data') or {}
+            for k in ('expiry', 'batch', 'location', 'barcode'):
+                if d.get(k):
+                    row[k] = d[k]
+            if d.get('counted') not in ('', None):
+                counts[e['label']] = d['counted']
+            if d.get('note'):
+                notes.append(f"{d['note']} ({e['label']})")
+        for k in ('expiry', 'batch', 'location', 'barcode'):
+            if not row[k] and base.get(k):
+                row[k] = base[k]
+        row['note'] = '; '.join(notes)
+        row['phones'] = _labels(e['label'] for e in ents)
+        if len(set(counts.values())) > 1:
+            row['conflict'] = ', '.join(f'{k} {v}' for k, v in counts.items())
+        elif counts:
+            row['counted'] = next(iter(counts.values()))
+            if len(counts) > 1:
+                row['agreed_by'] = _labels(counts)
+        rows[name] = row
+    if not rows and not draft:
+        return None
+    meta = dict(draft.get('meta') or {})
+    if entries:
+        phones = _labels(e['label'] for es in entries.values() for e in es)
+        meta['sheet'] = ', '.join(x for x in [meta.get('sheet') or '', f'phones: {phones}'] if x)
+        meta['phones'] = phones
+    meta['conflicts'] = sum(1 for r in rows.values() if r.get('conflict'))
+    return {'rows': list(rows.values()), 'meta': meta}
+
+
+def _receive_waiting(db: Any, login: Any, d: Doc) -> Doc | None:
+    """A delivery's waiting invoice lines with the phones' checks laid over
+    them. Once phones are checking the delivery, a line no phone has checked
+    starts unticked; a line two phones counted differently is flagged and
+    unticked until it is counted again."""
+    did = str(d['_id'])
+    draft = _draft_get(db, login, 'receive', did)
+    if not draft or not draft.get('rows'):
+        return None
+    rows = [dict(r) for r in draft['rows']]
+    entries = _phone_entries(db, 'receive', did)
+    phones_at_work = bool(entries) or any(r.get('phone_checked') for r in rows)
+    for i, r in enumerate(rows):
+        ents = entries.get(str(_line_no(r, i))) or []
+        r.pop('conflict', None)
+        if ents:
+            r.setdefault('invoice_units', r.get('units', ''))
+            units: dict[str, Any] = {}
+            notes = []
+            for e in ents:
+                dd = e.get('data') or {}
+                for k in ('batch', 'expiry'):
+                    if dd.get(k):
+                        r[k] = dd[k]
+                if dd.get('units') not in ('', None):
+                    units[e['label']] = dd['units']
+                if dd.get('note'):
+                    notes.append(dd['note'] + (f" ({e['label']})" if len(ents) > 1 else ''))
+            r['phone_note'] = '; '.join(notes)
+            r['phone_checked'] = True
+            r['phones'] = _labels(e['label'] for e in ents)
+            if len(set(units.values())) > 1:
+                r['conflict'] = ', '.join(f'{k} {v}' for k, v in units.items())
+                r['include'] = False
+            else:
+                if units:
+                    r['units'] = next(iter(units.values()))
+                set_at = r.get('include_set')
+                newest = max(e['sent_at'] for e in ents)
+                if not set_at or (isinstance(set_at, datetime) and newest > set_at):
+                    r['include'] = bool(r.get('matched'))
+        elif phones_at_work and not r.get('phone_checked') and not r.get('include_set'):
+            r['include'] = False
+        if r.get('phone_checked'):
+            r['problem'] = _receive_row_problems(r)
+    return {'rows': rows, 'meta': draft.get('meta') or {}}
 
 
 def _apply_shelf_details(medications: Collection, rows: list[Doc], st: Doc) -> int:
@@ -10736,8 +10933,11 @@ def _record_count(medications: Collection, transactions: Collection,
                   counted: float | None, note: str, user: str,
                   expiry: str | None = None,
                   batch: str | None = None,
-                  agree: bool = False) -> Doc | None:
+                  agree: bool = False, source: str = '') -> Doc | None:
     """Apply one line of a stock take. None if the medication is unknown.
+
+    source names where the figure came from when it was not typed on the
+    page: the phone(s) that counted it, or an uploaded sheet.
 
     The one place a count is recorded. The single-item path and the count
     sheet both come through here, so the sheet cannot drift into being a
@@ -10826,6 +11026,7 @@ def _record_count(medications: Collection, transactions: Collection,
         'note': note, 'counted_by': user, 'timestamp': now,
         'method': ('confirmed' if agree and 'balance' not in updates
                    else ('counted' if 'balance' in updates else 'detail')),
+        **({'source': source} if source else {}),
     }
     changes = []
     if expiry:
@@ -12383,7 +12584,8 @@ def phone_link() -> ResponseReturnValue:
 
 @app.route('/api/phone/hello', methods=['GET'])
 def phone_hello() -> ResponseReturnValue:
-    """For the app to check its link, and see what is open to count."""
+    """For the app to check its link, and see what is open to count. Items a
+    phone has already sent are not counted as still to do."""
     link = _phone_link_from_request()
     if not link:
         return _phone_refuse('This phone is not linked. Link it again from the Phone App page.', 401)
@@ -12392,17 +12594,24 @@ def phone_hello() -> ResponseReturnValue:
     info: Doc | None = None
     if st:
         _, _, sheet = _count_sheet(db['medications'], db['stock_take_counts'], st)
+        sent = set(_phone_entries(db, 'stock_take', str(st['_id'])))
+        sheet = [r for r in sheet if r['name'] not in sent]
         info = {'reference': st['reference'], 'groups': _scope_label(st),
                 'to_count': len(sheet),
                 'by_group': [{'group': g, 'label': label,
                               'to_count': sum(1 for r in sheet if r['group'] == g)}
                              for g, label in COUNT_GROUPS if g in _scope_groups(st)]}
-    return jsonify({'ok': True, 'linked_by': link.get('name'), 'stock_take': info})
+    return jsonify({'ok': True, 'linked_by': link.get('name'), 'phone': link.get('label'),
+                    'stock_take': info})
 
 
 @app.route('/api/phone/sheet', methods=['GET'])
 def phone_sheet() -> ResponseReturnValue:
-    """The open stock take's count sheet as CSV, all of it or one group."""
+    """The open stock take's count sheet as CSV, all of it or one group.
+
+    Several phones share the work: an item another phone has sent says so
+    in "Counted by", and the app passes over it; an item this phone sent
+    comes back with its own figure."""
     link = _phone_link_from_request()
     if not link:
         return _phone_refuse('This phone is not linked. Link it again from the Phone App page.', 401)
@@ -12412,6 +12621,15 @@ def phone_sheet() -> ResponseReturnValue:
         return _phone_refuse('No stock take is open. Open one on the Stock Take page first.', 404)
     _assign_missing_codes(db['medications'])
     _, _, sheet = _count_sheet(db['medications'], db['stock_take_counts'], st)
+    me = str(link['_id'])
+    for name, ents in _phone_entries(db, 'stock_take', str(st['_id'])).items():
+        row = next((r for r in sheet if r['name'] == name), None)
+        if row is None:
+            continue
+        row['counted_by'] = _labels(e['label'] for e in ents if e['link_id'] != me)
+        mine = next((e for e in ents if e['link_id'] == me), None)
+        if mine and (mine.get('data') or {}).get('counted') not in ('', None):
+            row['own_count'] = mine['data']['counted']
     grp = request.args.get('group') or ''
     labels = dict(COUNT_GROUPS)
     rows = [r for r in sheet if r['group'] == grp] if grp in labels else sheet
@@ -12421,8 +12639,9 @@ def phone_sheet() -> ResponseReturnValue:
 
 @app.route('/api/phone/counts', methods=['POST'])
 def phone_counts() -> ResponseReturnValue:
-    """Counts sent from the phone: they wait on the stock take page, as an
-    upload does, for the person who linked the phone to check and post."""
+    """Counts sent from a phone. Each phone's figure for each item is kept
+    as its own entry, so phones counting at once cannot overwrite each
+    other. They wait on the Stock Take page until posted there."""
     link = _phone_link_from_request()
     if not link:
         return _phone_refuse('This phone is not linked. Link it again from the Phone App page.', 401)
@@ -12439,10 +12658,24 @@ def phone_counts() -> ResponseReturnValue:
                             COUNT_UPLOAD_COLUMNS, COUNT_UPLOAD_NEEDS)
     except ValueError as e:
         return _phone_refuse(f'The counts could not be read: {e}.', 400)
-    msg = _stage_count_upload(db, db['medications'], link.get('login'), st, table)
-    msg = msg.replace(f'from "{table["sheet"]}"', 'from the phone')
-    return jsonify({'ok': True, 'stock_take': st['reference'],
-                    'message': msg + f' Open {st["reference"]} on the Stock Take page to post them.'})
+    got = _read_count_rows(db['medications'], st, table)
+    filled = got['filled']
+    _phone_entries_put(db, 'stock_take', str(st['_id']), link, filled)
+    waiting = _stock_take_waiting(db, link.get('login'), st) or {'rows': []}
+    disputed = [r['name'] for r in waiting['rows'] if r.get('conflict') and r['name'] in filled]
+    msg = f'{len(filled)} item(s) sent to {st["reference"]}.'
+    if disputed:
+        msg += (f' {len(disputed)} differ from another phone\'s count and are marked for a '
+                'recount: ' + _brief(disputed, 3) + '.')
+    if got['unknown']:
+        msg += ' Not on the medication list, left out: ' + _brief(got['unknown'], 3) + '.'
+    if got['outside']:
+        msg += ' Not in this stock take\'s groups, left out: ' + _brief(got['outside'], 3) + '.'
+    if got['bad']:
+        msg += ' Not read: ' + _brief(got['bad'], 3) + '.'
+    msg += f' Nothing is posted yet: open {st["reference"]} on the Stock Take page to post them.'
+    return jsonify({'ok': True, 'stock_take': st['reference'], 'message': msg,
+                    'sent': len(filled), 'disputed': len(disputed)})
 
 
 # --- Receiving with the phone ----------------------------------------
@@ -12454,7 +12687,7 @@ def phone_counts() -> ResponseReturnValue:
 # so a short delivery is seen before anything is received. Nothing is
 # received until Add These Lines is pressed on the delivery page.
 PHONE_RECEIVE_HEADINGS = ['Line', 'Code', 'Medication', 'Quantity', 'Pack size', 'Price per pack',
-                          'Batch', 'Expiry date', 'Barcode', 'Note', 'Checked', 'Received']
+                          'Batch', 'Expiry date', 'Barcode', 'Note', 'Checked', 'Received', 'Checked by']
 
 
 def _line_no(r: Doc, i: int) -> int:
@@ -12490,6 +12723,8 @@ def _receive_row_problems(r: Doc) -> str:
         diff = float(units) - float(r['invoice_units'])
         problems.append(f'invoice says {_num(float(r["invoice_units"]))}, counted {_num(float(units))} '
                         f'({f"short by {_num(-diff)}" if diff < 0 else f"{_num(diff)} more"})')
+    if r.get('conflict'):
+        problems.insert(0, f"phones disagree: {r['conflict']} - count it again")
     if r.get('phone_note'):
         problems.append('note: ' + r['phone_note'])
     return '; '.join(problems)
@@ -12504,8 +12739,7 @@ def phone_deliveries() -> ResponseReturnValue:
     db = get_mongo_client()['pharmacy_db']
     out = []
     for d in db['deliveries'].find({'status': 'open'}).sort('opened_at', -1).limit(20):
-        draft = _draft_get(db, link.get('login'), 'receive', str(d['_id'])) or {}
-        rows = draft.get('rows') or []
+        rows = (_receive_waiting(db, link.get('login'), d) or {}).get('rows') or []
         out.append({'id': str(d['_id']), 'reference': d['reference'],
                     'supplier': d.get('supplier') or '',
                     'invoices': ', '.join(i['number'] for i in _delivery_invoices(d) if i.get('number')),
@@ -12521,47 +12755,62 @@ def _phone_delivery(link: Doc, raw_id: str) -> tuple[Any, Doc | None, Doc | None
         return db, None, None, _phone_refuse('That delivery was not found.', 404)
     if d.get('status') != 'open':
         return db, d, None, _phone_refuse(f'Delivery {d["reference"]} is closed.', 409)
-    draft = _draft_get(db, link.get('login'), 'receive', str(d['_id']))
-    if not draft or not draft.get('rows'):
+    waiting = _receive_waiting(db, link.get('login'), d)
+    if not waiting or not waiting.get('rows'):
         return db, d, None, _phone_refuse(
             f'No invoice lines are waiting on {d["reference"]}. Upload the invoice on the delivery '
             'page first, then get the lines again.', 409)
-    return db, d, draft, None
+    return db, d, waiting, None
 
 
 @app.route('/api/phone/delivery/<delivery_id>/lines', methods=['GET', 'POST'])
 def phone_delivery_lines(delivery_id: str) -> ResponseReturnValue:
     """GET: the delivery's waiting invoice lines as CSV, for checking box by
-    box. POST: the lines as checked on the phone."""
+    box. POST: the lines as checked on a phone.
+
+    Each phone's check of each line is kept as its own entry, so several
+    phones can check one invoice at once without overwriting each other.
+    Two phones counting one line differently are flagged on the page."""
     link = _phone_link_from_request()
     if not link:
         return _phone_refuse('This phone is not linked. Link it again from the Phone App page.', 401)
-    db, d, draft, refused = _phone_delivery(link, delivery_id)
-    if refused is not None or d is None or draft is None:
+    db, d, waiting, refused = _phone_delivery(link, delivery_id)
+    if refused is not None or d is None or waiting is None:
         return refused if refused is not None else _phone_refuse('Not found.', 404)
     medications = db['medications']
-    rows: Docs = draft['rows']
+    rows: Docs = waiting['rows']
     names = [r.get('name') for r in rows if r.get('name')]
     meds = {m['name']: m for m in medications.find({'name': {'$in': names}},
                                                    {'_id': 0, 'name': 1, 'code': 1, 'barcode': 1})}
+    did = str(d['_id'])
+    me = str(link['_id'])
     if request.method == 'GET':
+        entries = _phone_entries(db, 'receive', did)
         out = io.StringIO()
         w = csv.writer(out)
         w.writerow(PHONE_RECEIVE_HEADINGS)
         for i, r in enumerate(rows):
             exp = r.get('expiry') or ''
             m = meds.get(r.get('name') or '') or {}
+            ln = _line_no(r, i)
             done = bool(r.get('phone_checked'))
-            # Quantity is the invoice's own figure, even after the phone
-            # changed it; Received is what was counted. Lines already checked
-            # come back checked, so getting the lines again - on another
-            # phone, or after clearing - carries on where the work stopped.
-            w.writerow([_line_no(r, i), m.get('code') or '', r.get('name') or r.get('raw') or '',
+            others = _labels(e['label'] for e in entries.get(str(ln), []) if e['link_id'] != me)
+            # Quantity is the invoice's own figure; Received is what was
+            # counted. Lines already checked come back checked, so getting the
+            # lines again carries on where the work stopped; "Checked by"
+            # names the other phones that checked a line, and a line the
+            # phones disagree on comes back unchecked, to be counted again.
+            disputed = bool(r.get('conflict'))
+            w.writerow([ln, m.get('code') or '', r.get('name') or r.get('raw') or '',
                         r.get('invoice_units', r.get('units', '')), r.get('pack_size') or 1,
                         r.get('pack_price', ''), r.get('batch') or '',
                         datetime.strptime(exp, '%Y-%m-%d').strftime('%d/%m/%Y') if exp else '',
-                        m.get('barcode') or '', (r.get('phone_note') or '') if done else '',
-                        'yes' if done else '', r.get('units', '') if done else ''])
+                        m.get('barcode') or '',
+                        (('phones disagree: ' + r['conflict']) if disputed
+                         else (r.get('phone_note') or '')) if done else '',
+                        'yes' if done and not disputed else '',
+                        r.get('units', '') if done and not disputed else '',
+                        others])
         resp = make_response(out.getvalue().encode('utf-8-sig'))
         resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
         resp.headers['Content-Disposition'] = f'attachment; filename="{d["reference"]}-lines.csv"'
@@ -12577,23 +12826,22 @@ def phone_delivery_lines(delivery_id: str) -> ResponseReturnValue:
     except ValueError as e:
         return _phone_refuse(f'The lines could not be read: {e}.', 400)
     cols = table['cols']
-    checked = short = over = 0
     bad: list[str] = []
     shelf: Docs = []
+    mine: dict[str, Doc] = {}
     by_line = {_line_no(r, i): r for i, r in enumerate(rows)}
     for t in table['rows']:
-        ln = _cell_num(_cell(t, cols, 'line'))
-        if ln is None or not float(ln).is_integer() or int(ln) not in by_line:
+        line_cell = _cell_num(_cell(t, cols, 'line'))
+        if line_cell is None or not float(line_cell).is_integer() or int(line_cell) not in by_line:
             continue
         if str(_cell(t, cols, 'checked') or '').strip().lower() not in ('yes', 'y', 'true', '1', 'x', 'checked'):
             continue
-        r = by_line[int(ln)]
+        r = by_line[int(line_cell)]
         sent_name = str(_cell(t, cols, 'med') or '').strip()
         if sent_name and _match_key(sent_name) != _match_key(r.get('name') or r.get('raw') or ''):
-            bad.append(f'line {int(ln)}: the line is now {r.get("name")}, not {sent_name}')
+            bad.append(f'line {int(line_cell)}: the line is now {r.get("name")}, not {sent_name}')
             continue
-        if 'invoice_units' not in r:
-            r['invoice_units'] = r.get('units', '')
+        entry: Doc = {'units': '', 'batch': '', 'expiry': '', 'note': ''}
         # The phone sends single units ("Units"); a plain Quantity is read the same.
         qty = _cell_num(_cell(t, cols, 'units'))
         if qty is None:
@@ -12602,50 +12850,54 @@ def phone_delivery_lines(delivery_id: str) -> ResponseReturnValue:
             if qty < 0 or not float(qty).is_integer():
                 bad.append(f'{r.get("name")}: quantity {qty:g} is not a whole number')
             else:
-                r['units'] = _num(qty)
+                entry['units'] = _num(qty)
         batch = str(_cell(t, cols, 'batch') or '').strip()
         if batch and batch.lower() not in UPLOAD_BLANKS:
-            r['batch'] = batch
+            entry['batch'] = batch
         exp, bad_date = _checklist_date(_cell(t, cols, 'expiry'))
         if bad_date:
             bad.append(f'{r.get("name")}: expiry {bad_date}')
         elif exp:
-            r['expiry'] = exp
+            entry['expiry'] = exp
         note = str(_cell(t, cols, 'note') or '').strip()
-        r['phone_note'] = '' if note.lower() in UPLOAD_BLANKS else note[:200]
+        if note.lower().startswith('phones disagree'):
+            note = ''           # the page's own flag, sent back: not a note
+        entry['note'] = '' if note.lower() in UPLOAD_BLANKS else note[:200]
         bc = _clean_barcode(_cell(t, cols, 'barcode'))
         if bc and r.get('matched') and bc != (meds.get(r.get('name') or '') or {}).get('barcode'):
             shelf.append({'name': r['name'], 'barcode': bc})
-        r['phone_checked'] = True
-        r['include'] = bool(r.get('matched'))
-        r['problem'] = _receive_row_problems(r)
-        checked += 1
-        inv, got = _cell_num(r.get('invoice_units')), _cell_num(r.get('units'))
-        if inv is not None and got is not None and got != inv:
-            if got < inv:
+        mine[str(int(line_cell))] = entry
+    _phone_entries_put(db, 'receive', did, link, mine)
+    saved = _apply_shelf_details(medications, shelf, {'reference': d['reference']}) if shelf else 0
+    after = (_receive_waiting(db, link.get('login'), d) or {}).get('rows') or []
+    short = over = disputed_n = 0
+    for i, r in enumerate(after):
+        if str(_line_no(r, i)) not in mine:
+            continue
+        if r.get('conflict'):
+            disputed_n += 1
+            continue
+        inv, got_ = _cell_num(r.get('invoice_units')), _cell_num(r.get('units'))
+        if inv is not None and got_ is not None and got_ != inv:
+            if got_ < inv:
                 short += 1
             else:
                 over += 1
-    # Once the phone is checking this invoice, a line it has not checked
-    # starts unticked on the page, so nothing is received uncounted by
-    # accident. A line someone ticked by hand on the page stays as they set it.
-    for i, r in enumerate(rows):
-        r.setdefault('line', i + 1)
-        if not r.get('phone_checked') and not r.get('include_set'):
-            r['include'] = False
-    _draft_put(db, link.get('login'), 'receive', str(d['_id']), rows, draft.get('meta'))
-    saved = _apply_shelf_details(medications, shelf, {'reference': d['reference']}) if shelf else 0
-    msg = f'{checked} line(s) of {d["reference"]} checked on the phone.'
+    msg = f'{len(mine)} line(s) of {d["reference"]} checked on the phone.'
     if short or over:
         n_diff = short + over
         msg += (f' {n_diff} {"line differs" if n_diff == 1 else "lines differ"} from the invoice'
                 f' ({short} short, {over} more), marked in red on the delivery page.')
+    if disputed_n:
+        msg += (f' {disputed_n} {"line was" if disputed_n == 1 else "lines were"} counted differently '
+                'on another phone - count again.')
     if saved:
         msg += f' {saved} barcode(s) saved.'
     if bad:
         msg += ' Not read: ' + _brief(bad, 3) + '.'
     msg += f' Nothing is received yet: open {d["reference"]} and press Add These Lines.'
-    return jsonify({'ok': True, 'message': msg, 'checked': checked, 'short': short, 'over': over})
+    return jsonify({'ok': True, 'message': msg, 'checked': len(mine), 'short': short, 'over': over,
+                    'disputed': disputed_n})
 
 
 # FIX (Bug, regression): init_audit() must run at module level, not inside

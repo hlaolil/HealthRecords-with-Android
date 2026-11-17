@@ -8,6 +8,7 @@
                 display: none; }
   .draft-note.shown { display: block; }
 .up-phone { display: inline-block; font-size: 11px; color: #166534; background: #dcfce7; border-radius: 6px; padding: 0 5px; margin-top: 2px; }
+.up-phone-bad { color: #991b1b; background: #fee2e2; }
 .up-phone-sum { font-size: 13px; background: #f0fdf4; border-left: 4px solid #16a34a; padding: 6px 10px; }
 </style>
 <style>
@@ -273,7 +274,8 @@ receive part of an invoice now and the rest later.</p>{% endif %}
                        autocomplete="off" style="width:16em;">
                 <input type="hidden" name="raw__{{ loop.index0 }}" value="{{ r.raw }}">
                 {% if r.raw and r.raw != r.name %}<br><small>sheet: {{ r.raw }}</small>{% endif %}
-                {% if r.phone_checked %}<span class="up-phone" title="Checked box by box on the phone">&#10003; checked on phone</span>{% endif %}
+                {% if r.conflict %}<span class="up-phone up-phone-bad" title="Two phones counted this line differently">&#10007; phones disagree</span>
+                {% elif r.phone_checked %}<span class="up-phone" title="Checked box by box on the phone">&#10003; checked on {{ r.phones or 'phone' }}</span>{% endif %}
                 {% if r.problem %}<span class="up-why">{{ r.problem }}</span>{% endif %}</td>
             <td><input type="checkbox" class="up-inc" name="inc__{{ loop.index0 }}" value="1"
                        {% if r.include is not defined or r.include %}{% if r.matched or r.include %}checked{% endif %}{% endif %}></td>

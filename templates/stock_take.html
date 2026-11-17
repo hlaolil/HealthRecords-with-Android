@@ -32,6 +32,10 @@
 .st-scope-row input { width: auto; margin: 0; }
 .st-scope-name { min-width: 10em; font-weight: bold; }
 .st-scope-last { font-size: 12px; color: #555; }
+.st-from { font-size: 11px; color: #1e40af; }
+.st-from-bad { color: #b91c1c; font-weight: bold; }
+tr.st-dispute td { background: #fef2f2; }
+.st-dispute-n { color: #b91c1c; }
 .st-loc { font-size: 11px; color: #555; border: 1px solid #bbb; border-radius: 6px; padding: 0 4px; }
 .st-csv { font-size: 11px; border: 1px solid #0056b3; border-radius: 8px; padding: 0 5px; margin-left: 3px; text-decoration: none; }
 .st-groups { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
@@ -171,6 +175,9 @@ ticking.</p>
     {% if upload_draft.meta.guesses %}<br>Matched by a close spelling &mdash; check: {{ upload_draft.meta.guesses|join('; ') }}.{% endif %}
     {% if upload_draft.meta.unknown %}<br>Not on the medication list, left out: {{ upload_draft.meta.unknown|join('; ') }}.{% endif %}
     {% if upload_draft.meta.bad %}<br>Not read: {{ upload_draft.meta.bad|join('; ') }}.{% endif %}
+    {% if upload_draft.meta.conflicts %}<br><strong class="st-dispute-n">{{ upload_draft.meta.conflicts }} item(s) were counted
+    differently on different phones</strong> &mdash; marked in red below with each phone's figure. They are not posted
+    until someone counts them again and types the figure.{% endif %}
     <form method="POST" action="{{ url_for('stock_take') }}" style="display:inline;margin:0;padding:0;background:none;box-shadow:none;">
         <input type="hidden" name="action" value="post_uploaded">
         <input type="hidden" name="stock_take_id" value="{{ active._id|string }}">
@@ -209,8 +216,11 @@ ticking.</p>
         </thead>
         <tbody>
         {% for m in sheet %}
-            <tr data-group="{{ m.group }}"{% if m.pre %} class="close-to-expire" title="filled from the uploaded sheet"{% endif %}>
-                <td>{{ m.name }}{% if m.location %} <span class="st-loc">{{ m.location }}</span>{% endif %}<input type="hidden" name="med__{{ loop.index0 }}" value="{{ m.name }}"></td>
+            <tr data-group="{{ m.group }}"{% if m.pre and m.pre.conflict %} class="st-dispute" title="the phones disagree"{% elif m.pre %} class="close-to-expire" title="filled from the uploaded sheet"{% endif %}>
+                <td>{{ m.name }}{% if m.location %} <span class="st-loc">{{ m.location }}</span>{% endif %}
+                    {%- if m.pre and m.pre.conflict %}<br><span class="st-from st-from-bad">Phones disagree: {{ m.pre.conflict }}. Count it again.</span>
+                    {%- elif m.pre and m.pre.agreed_by %}<br><span class="st-from">{{ m.pre.agreed_by }} agree</span>
+                    {%- elif m.pre and m.pre.phones %}<br><span class="st-from">from {{ m.pre.phones }}</span>{% endif %}<input type="hidden" name="med__{{ loop.index0 }}" value="{{ m.name }}"></td>
                 <td class="st-system">{{ m.balance }}</td>
                 <td class="st-agree"><input name="agree__{{ loop.index0 }}" type="checkbox"
                            aria-label="{{ m.name }} matches the system"></td>
@@ -443,7 +453,7 @@ may be left blank if you only need to fix an expiry date or a batch number
                     {%- else -%}{{ c.batch_after }}{%- endif -%}
                 {% else %}&ndash;{% endif %}</td>
             <td>{{ c.counted_by }}</td>
-            <td>{{ c.note or '-' }}
+            <td>{{ c.note or '-' }}{% if c.source %}<br><small class="st-from">{{ c.source }}</small>{% endif %}
                 {%- for e in c.edits or [] %}<br><small>Edited {{ e.at.strftime('%d %b %H:%M') }} by {{ e.by }}: {{ '(none)' if e['from'] is none else e['from'] }} &rarr; {{ e.to }} &mdash; {{ e.reason }}</small>{% endfor %}</td>
             {% if active.status == 'open' %}
             <td><button type="button" class="st-edit-btn" data-for="ed_{{ c._id }}">Edit</button></td>
