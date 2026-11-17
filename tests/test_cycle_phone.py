@@ -156,7 +156,7 @@ check('the sheet is in shelf order: B2 before B10, no location last',
 check('each row shows its location', '<span class="st-loc">B10</span>' in page)
 rows = csv_rows(c.get(f'/stock-take?stock_take_id={sid}&download=sheet&format=csv').data)
 check('the CSV carries location, pack size and barcode',
-      rows[0] == A.COUNT_SHEET_CSV_HEADINGS and rows[0][8:] == ['Location', 'Pack size', 'Barcode'])
+      rows[0] == A.COUNT_SHEET_CSV_HEADINGS and rows[0][8:] == ['Location', 'Pack size', 'Barcode', 'Counted by'])
 amox = next(x for x in rows if x[1] == 'Amoxicillin caps, 500 mg')
 check('with the values', amox[8] == 'B10' and amox[9] == '28' and amox[10] == '', amox)
 check('the CSV is in shelf order too', [x[1] for x in rows[1:]] == order)
@@ -284,10 +284,10 @@ w.writerow([mor[0], mor[1], mor[2], '7', '', '', 'cupboard', 'CD1', '60055500011
 r = api.post('/api/phone/counts', headers={**H, 'Content-Type': 'text/csv'},
              data=('﻿' + out.getvalue()).encode('utf-8'))
 j = r.get_json()
-check('the phone sends its counts', r.status_code == 200 and j['ok'] and 'from the phone' in j['message'], j)
-d = db['upload_drafts'].find_one()
-check('they wait as uploaded figures for the person who linked the phone',
-      d and d['login'] == 'admin' and d['rows'][0]['counted'] == 7, d)
+check('the phone sends its counts', r.status_code == 200 and j['ok'] and j['sent'] == 1, j)
+e_ = db['phone_entries'].find_one()
+check('they wait as that phone\'s entry for the item', e_ and e_['label'] == 'Pharmacy Samsung'
+      and e_['key'] == 'Morphine tabs, 10 mg' and e_['data']['counted'] == 7, e_)
 check('nothing is posted by sending', meds.find_one({'name': 'Morphine tabs, 10 mg'})['balance'] == 10)
 page = c.get(f'/stock-take?stock_take_id={sid}').text
 check('the page shows them, ready for Post Uploaded Counts', 'value="post_uploaded"' in page)
@@ -363,8 +363,9 @@ j = r.get_json()
 check('the phone sends its checks', r.status_code == 200 and j['checked'] == 2 and j['short'] == 1, j)
 check('the message says what differs and that nothing is received yet',
       '1 short' in j['message'] and 'Nothing is received yet' in j['message'], j['message'])
-d = db['upload_drafts'].find_one({'kind': 'receive'})
-L = d['rows']
+def waiting():
+    return (A._receive_waiting(db, 'admin', db['deliveries'].find_one()) or {}).get('rows') or []
+L = waiting()
 check('a checked line takes the batch and expiry read off the box',
       L[0]['batch'] == 'AX9' and L[0]['expiry'] == '2028-04-30' and L[0]['phone_checked'], L[0])
 check('a line counted as invoiced has nothing left to flag', L[0]['problem'] == '', L[0]['problem'])
@@ -379,7 +380,7 @@ check('a scanned barcode is saved to the item',
 check('nothing is received by sending', db['transactions'].count_documents({'type': 'receive'}) == 0)
 page = c.get(f'/receive?delivery_id={did}').text
 check('the delivery page shows the phone checks and the shortage',
-      '2 of 3</strong> line(s) checked on the phone' in page and page.count('checked on phone</span>') == 2
+      '2 of 3</strong> line(s) checked on the phone' in page and page.count('checked on Receiving phone</span>') == 2
       and 'short by 10' in page)
 rows = csv_rows(api.get(f'/api/phone/delivery/{did}/lines', headers=H).data)
 check('getting the lines again still shows the invoiced figure', rows[2][3] == '100', rows[2])
@@ -405,7 +406,7 @@ for i, x in enumerate(L):
 r = c.post('/receive', data=form, follow_redirects=True)
 check('Add These Lines receives what was counted on the phone',
       sorted(t['quantity'] for t in db['transactions'].find({'type': 'receive'})) == [56, 90], banner(r.text))
-left = (db['upload_drafts'].find_one({'kind': 'receive'}) or {}).get('rows') or []
+left = waiting()
 check('the unticked line stays waiting, with its own line number',
       [(x['name'], x['line']) for x in left] == [('Cetirizine tabs, 10 mg', 3)]
       and 'still waiting below' in banner(r.text), (left, banner(r.text)))
@@ -415,7 +416,7 @@ w3 = io.StringIO(); ww = csv.writer(w3)
 ww.writerow(['Line', 'Medication', 'Units', 'Batch', 'Expiry date', 'Checked'])
 ww.writerow(['3', 'Cetirizine tabs, 10 mg', '30', 'C5', '12/2028', 'yes'])
 j = api.post(f'/api/phone/delivery/{did}/lines', headers=H, data=w3.getvalue().encode()).get_json()
-left = db['upload_drafts'].find_one({'kind': 'receive'})['rows']
+left = waiting()
 check('and checks it later', j['checked'] == 1 and left[0]['batch'] == 'C5'
       and left[0]['expiry'] == '2028-12-31' and left[0]['problem'] == '', (j, left))
 form = {'action': 'lines_bulk', 'delivery_id': did, 'n': '1', 'inc__0': '1', 'med__0': left[0]['name'],
@@ -428,6 +429,134 @@ db['deliveries'].update_one({'_id': db['deliveries'].find_one()['_id']}, {'$set'
 r = api.get(f'/api/phone/delivery/{did}/lines', headers=H)
 check('a closed delivery is refused', r.status_code == 409 and 'closed' in r.get_json()['message'])
 check('without the key, refused', api.get('/api/phone/deliveries').status_code == 401)
+
+
+# =====================================================================
+print('\n== Several phones at once: stock take ==')
+reset(); login()
+db['phone_entries'].delete_many({})
+def link_phone(label):
+    r = c.post('/phone-link', data={'action': 'create', 'label': label})
+    k = re.search(r'NMCST1\|[^|<]+\|([A-Za-z0-9_\-]+)', r.text).group(1)
+    return {'Authorization': f'Bearer {k}'}
+HA, HB = link_phone('Samsung'), link_phone('Tecno')
+sid, _ = open_st()
+def send(h, rows_):
+    o = io.StringIO(); w = csv.writer(o)
+    w.writerow(['Medication', 'Physical count', 'Note'])
+    for r_ in rows_:
+        w.writerow(r_)
+    return api.post('/api/phone/counts', headers=h, data=o.getvalue().encode()).get_json()
+ja = send(HA, [['Amoxicillin caps, 500 mg', 40, ''], ['Paracetamol tabs, 500 mg', 10, '']])
+rows = csv_rows(api.get('/api/phone/sheet', headers=HB).data)
+amx = next(x for x in rows if x[1] == 'Amoxicillin caps, 500 mg')
+check("phone B's sheet says phone A has counted an item", amx[11] == 'Samsung' and amx[3] == '', amx)
+rows_a = csv_rows(api.get('/api/phone/sheet', headers=HA).data)
+amx_a = next(x for x in rows_a if x[1] == 'Amoxicillin caps, 500 mg')
+check("phone A's own sheet brings back its own figure", amx_a[3] == '40' and amx_a[11] == '', amx_a)
+j = api.get('/api/phone/hello', headers=HB).get_json()
+check('items already sent are not "still to count"', j['stock_take']['to_count'] == 4, j['stock_take'])
+jb = send(HB, [['Amoxicillin caps, 500 mg', 38, 'top shelf'], ['Cetirizine tabs, 10 mg', 5, '']])
+check('phone B is told it disagrees with another phone', jb['disputed'] == 1
+      and 'differ from another phone' in jb['message'], jb)
+check("each phone's figures are kept separately", db['phone_entries'].count_documents({}) == 4)
+w_ = {r_['name']: r_ for r_ in A._stock_take_waiting(db, 'admin', db['stock_takes'].find_one({'status': 'open'}))['rows']}
+check('the disagreement is flagged with both figures, and no count is filled in',
+      w_['Amoxicillin caps, 500 mg'].get('conflict') == 'Samsung 40, Tecno 38'
+      and w_['Amoxicillin caps, 500 mg']['counted'] == '', w_['Amoxicillin caps, 500 mg'])
+check('items only one phone counted carry its name',
+      w_['Paracetamol tabs, 500 mg']['phones'] == 'Samsung' and w_['Cetirizine tabs, 10 mg']['phones'] == 'Tecno')
+page = c.get(f'/stock-take?stock_take_id={sid}').text
+check('the page shows the disagreement in red, and who sent the others',
+      'Phones disagree: Samsung 40, Tecno 38. Count it again.' in page and 'from Samsung' in page
+      and 'from Tecno' in page and '1 item(s) were counted' in page)
+r = c.post('/stock-take', data={'action': 'post_uploaded', 'stock_take_id': sid}, follow_redirects=True)
+check('Post Uploaded Counts posts the agreed items, not the disputed one',
+      meds.find_one({'name': 'Paracetamol tabs, 500 mg'})['balance'] == 10
+      and meds.find_one({'name': 'Cetirizine tabs, 10 mg'})['balance'] == 5
+      and meds.find_one({'name': 'Amoxicillin caps, 500 mg'})['balance'] == 10
+      and 'phones disagree on were not posted' in banner(r.text), banner(r.text))
+line = db['stock_take_counts'].find_one({'med_name': 'Paracetamol tabs, 500 mg'})
+check('each count records the phone it came from', line.get('source') == 'phone: Samsung', line)
+check('the disputed item stays waiting; the posted ones are cleared',
+      sorted(e['key'] for e in db['phone_entries'].find()) == ['Amoxicillin caps, 500 mg'] * 2)
+send(HB, [['Amoxicillin caps, 500 mg', 40, 'recounted']])
+w_ = {r_['name']: r_ for r_ in A._stock_take_waiting(db, 'admin', db['stock_takes'].find_one({'status': 'open'}))['rows']}
+check('when phone B recounts and agrees, the item is ready, both named',
+      not w_['Amoxicillin caps, 500 mg'].get('conflict') and w_['Amoxicillin caps, 500 mg']['counted'] == 40
+      and w_['Amoxicillin caps, 500 mg']['agreed_by'] == 'Samsung, Tecno', w_['Amoxicillin caps, 500 mg'])
+page = c.get(f'/stock-take?stock_take_id={sid}').text
+check('the page says they agree', 'Samsung, Tecno agree' in page)
+c.post('/stock-take', data={'action': 'post_uploaded', 'stock_take_id': sid})
+line = db['stock_take_counts'].find_one({'med_name': 'Amoxicillin caps, 500 mg'})
+check('posted, recorded as counted by both phones',
+      meds.find_one({'name': 'Amoxicillin caps, 500 mg'})['balance'] == 40
+      and line.get('source') == 'phone: Samsung, Tecno' and db['phone_entries'].count_documents({}) == 0, line)
+page = c.get(f'/stock-take?stock_take_id={sid}').text
+check('the counted list shows where each count came from', 'phone: Samsung, Tecno' in page)
+
+# Phones sending at the same moment
+import threading
+reset(); login(); db['phone_entries'].delete_many({})
+for k in range(60):
+    med(f'Race item {k:02d}')
+HA, HB = link_phone('Samsung'), link_phone('Tecno')
+sid, _ = open_st()
+def burst(h, names):
+    cl = A.app.test_client()
+    o = io.StringIO(); w = csv.writer(o); w.writerow(['Medication', 'Physical count'])
+    for n in names:
+        w.writerow([n, 3])
+    cl.post('/api/phone/counts', headers=h, data=o.getvalue().encode())
+names = [f'Race item {k:02d}' for k in range(60)]
+ts = [threading.Thread(target=burst, args=(h, part)) for h, part in
+      ((HA, names[:30]), (HB, names[30:]), (HA, names[:30]), (HB, names[30:]))]
+for t_ in ts: t_.start()
+for t_ in ts: t_.join()
+w_ = A._stock_take_waiting(db, 'admin', db['stock_takes'].find_one({'status': 'open'}))['rows']
+check('two phones sending at once: nothing lost', sorted(r_['name'] for r_ in w_) == names, len(w_))
+
+# =====================================================================
+print('\n== Several phones at once: receiving ==')
+reset(); login(); db['phone_entries'].delete_many({}); db['deliveries'].delete_many({})
+HA, HB = link_phone('Samsung'), link_phone('Tecno')
+did = str(db['deliveries'].insert_one({
+    'reference': 'DEL-TWO', 'supplier': 'NDSO', 'order_number': 'PO-2', 'invoice_number': 'INV-9',
+    'invoice_total': 50.0, 'order_total': 50.0, 'stock_receiver': 'x', 'status': 'open',
+    'opened_at': datetime.utcnow(), 'received_by': 'x'}).inserted_id)
+inv = ('Medication,Quantity,Pack size,Price per pack,Batch,Expiry date\n'
+       '"Amoxicillin caps, 500 mg",56,28,40,,\n"Paracetamol tabs, 500 mg",100,1,0.5,P1,2028-06-30\n'
+       '"Cetirizine tabs, 10 mg",30,1,0.2,C1,2028-01-31\n')
+c.post('/receive', data={'action': 'upload_lines', 'delivery_id': did, 'qty_mode': 'units',
+                         'sheet': (io.BytesIO(inv.encode()), 'inv.csv')}, content_type='multipart/form-data')
+def check_lines(h, rows_):
+    o = io.StringIO(); w = csv.writer(o)
+    w.writerow(['Line', 'Units', 'Batch', 'Expiry date', 'Checked'])
+    for r_ in rows_:
+        w.writerow(r_)
+    return api.post(f'/api/phone/delivery/{did}/lines', headers=h, data=o.getvalue().encode()).get_json()
+check_lines(HA, [[1, 56, 'AX1', '04/2028', 'yes'], [2, 100, '', '', 'yes']])
+rows = csv_rows(api.get(f'/api/phone/delivery/{did}/lines', headers=HB).data)
+check("phone B sees which lines phone A checked", rows[1][12] == 'Samsung' and rows[1][10] == 'yes'
+      and rows[3][12] == '', rows[1])
+jb = check_lines(HB, [[1, 50, 'AX1', '04/2028', 'yes'], [3, 30, '', '', 'yes']])
+check('phone B is told it disagrees on line 1', jb['disputed'] == 1, jb)
+L = {r_['line']: r_ for r_ in (A._receive_waiting(db, 'admin', db['deliveries'].find_one()) or {})['rows']}
+check('line 1 is flagged with both counts and unticked',
+      L[1].get('conflict') == 'Samsung 56, Tecno 50' and L[1]['include'] is False
+      and 'phones disagree: Samsung 56, Tecno 50 - count it again' in L[1]['problem'], L[1])
+check('lines 2 and 3, each checked by one phone, are ticked and named',
+      L[2]['include'] and L[2]['phones'] == 'Samsung' and L[3]['include'] and L[3]['phones'] == 'Tecno')
+page = c.get(f'/receive?delivery_id={did}').text
+check('the delivery page shows it', 'phones disagree</span>' in page and 'checked on Samsung</span>' in page
+      and 'checked on Tecno</span>' in page)
+rows = csv_rows(api.get(f'/api/phone/delivery/{did}/lines', headers=HA).data)
+check('a disputed line goes back to the phones unchecked, saying why',
+      rows[1][10] == '' and 'phones disagree' in rows[1][9], rows[1])
+check_lines(HA, [[1, 50, 'AX1', '04/2028', 'yes']])
+L = {r_['line']: r_ for r_ in (A._receive_waiting(db, 'admin', db['deliveries'].find_one()) or {})['rows']}
+check('recounted to agree: ticked, at the agreed figure', not L[1].get('conflict') and L[1]['include']
+      and str(L[1]['units']) == '50' and 'short by 6' in L[1]['problem'], L[1])
 
 print(f"\n=========  {len(PASS)} passed, {len(FAIL)} failed  =========")
 if FAIL:
